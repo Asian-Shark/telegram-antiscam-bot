@@ -1,5 +1,9 @@
 import asyncio
 import logging
+import json
+import os
+from pathlib import Path
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -9,421 +13,217 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-
 from aiogram.client.default import DefaultBotProperties
-
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
 
 
 # ---------------- НАСТРОЙКИ ----------------
 
-TOKEN = "BOT_TOKEN"
-
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(
-    token=TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
-)
+# Локально: вставь токен сюда.
+# На сервере: задай переменную окружения BOT_TOKEN (она будет иметь приоритет).
+FALLBACK_TOKEN = "PASTE_YOUR_TOKEN_HERE"
 
-dp = Dispatcher(storage=MemoryStorage())
+TOKEN = os.getenv("BOT_TOKEN") or FALLBACK_TOKEN
+if not TOKEN or TOKEN == "PASTE_YOUR_TOKEN_HERE":
+    raise RuntimeError(
+        "Не задан токен. Локально вставь токен в FALLBACK_TOKEN, "
+        "а на сервере задай переменную окружения BOT_TOKEN."
+    )
+
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+dp = Dispatcher()
+
+CONTENT_RU_PATH = Path("data/content_ru.json")
+CONTENT_KZ_PATH = Path("data/content_kz.json")
+
+# user_id -> "ru" | "kz"
+USER_LANG: dict[int, str] = {}
 
 
-# ---------------- СОСТОЯНИЯ ДЛЯ ЗАЯВЛЕНИЯ ----------------
+# ---------------- ЗАГРУЗКА КОНТЕНТА ----------------
 
-class ClaimForm(StatesGroup):
-    fullname = State()
-    datetime = State()
-    channel = State()
-    description = State()
-    amount = State()
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        raise RuntimeError(f"Не найден файл контента: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+CONTENT_RU = load_json(CONTENT_RU_PATH)
+CONTENT_KZ = load_json(CONTENT_KZ_PATH)
+
+
+def content_for(user_id: int) -> dict:
+    lang = USER_LANG.get(user_id, "ru")
+    return CONTENT_KZ if lang == "kz" else CONTENT_RU
+
+
+def get_category_by_id(content: dict, cat_id: str) -> Optional[dict]:
+    for c in content.get("categories", []):
+        if c.get("id") == cat_id:
+            return c
+    return None
+
+
+def render_category_text(content: dict, cat: dict) -> str:
+    title = cat.get("title", cat.get("button", "Инструкция"))
+    steps = cat.get("steps", [])
+    important = cat.get("important", "")
+    contacts = cat.get("contacts", [])
+    laws = cat.get("laws", [])
+
+    labels = content.get("labels", {})
+    plan_label = labels.get("plan", "План действий")
+    important_label = labels.get("important", "Важно")
+    where_label = labels.get("where", "Куда обращаться")
+    laws_label = labels.get("laws", "Нормы/законы")
+
+    lines = [f"*{title}*", "", f"*{plan_label}:*"]
+    for i, step in enumerate(steps, 1):
+        lines.append(f"{i}. {step}")
+
+    if important:
+        lines.append("")
+        lines.append(f"*{important_label}:* {important}")
+
+    if contacts:
+        lines.append("")
+        lines.append(f"*{where_label}:*")
+        for item in contacts:
+            lines.append(f"• {item}")
+
+    if laws:
+        lines.append("")
+        lines.append(f"*{laws_label}:*")
+        for law in laws:
+            lines.append(f"• {law}")
+
+    return "\n".join(lines)
 
 
 # ---------------- КЛАВИАТУРЫ ----------------
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    """
-    Главное меню – список ситуаций, что произошло.
-    """
+def lang_keyboard() -> InlineKeyboardMarkup:
+    kb = [[
+        InlineKeyboardButton(text="🇷🇺 Русский", callback_data="set_lang:ru"),
+        InlineKeyboardButton(text="🇰🇿 Қазақша", callback_data="set_lang:kz"),
+    ]]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def main_keyboard(content: dict) -> InlineKeyboardMarkup:
+    kb = []
+    for cat in content.get("categories", []):
+        cat_id = cat["id"]
+        btn_text = cat.get("button", cat_id)
+
+        # eGov/ЭЦП — отдельное подменю
+        if cat_id == "egov_ecp_hacked":
+            kb.append([InlineKeyboardButton(text=btn_text, callback_data="case_gos")])
+        else:
+            kb.append([InlineKeyboardButton(text=btn_text, callback_data=f"case_json:{cat_id}")])
+
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def scenario_keyboard(content: dict, previous: str) -> InlineKeyboardMarkup:
+    nav = content.get("nav", {})
+    back_text = nav.get("back", "⬅️ Назад")
+    home_text = nav.get("home", "🏠 В главное меню")
+
     kb = [
-        [InlineKeyboardButton(
-            text="🖥 Взломали «Госуслуги», не могу зайти в аккаунт",
-            callback_data="case_gos"
-        )],
-        [InlineKeyboardButton(
-            text="📱 Взломали социальную сеть (мессенджер)",
-            callback_data="case_social"
-        )],
-        [InlineKeyboardButton(
-            text="📄 На меня оформили кредит, микрозайм",
-            callback_data="case_credit"
-        )],
-        [InlineKeyboardButton(
-            text="💸 Переведены деньги без моего согласия",
-            callback_data="case_money"
-        )],
-        [InlineKeyboardButton(
-            text="🤝 Перевёл деньги мошенникам",
-            callback_data="case_scam"
-        )],
-        [InlineKeyboardButton(
-            text="🚚 Отдал деньги курьеру мошенников",
-            callback_data="case_courier"
-        )],
-        [InlineKeyboardButton(
-            text="📵 Недоступна SIM-карта",
-            callback_data="case_sim"
-        )],
-        [InlineKeyboardButton(
-            text="🛒 Оплатил услугу, оформил подписку, купил товар",
-            callback_data="case_purchase"
-        )],
-        [InlineKeyboardButton(
-            text="🦠 Устройство заражено вирусом",
-            callback_data="case_virus"
-        )],
-        [InlineKeyboardButton(
-            text="🔍 Обнаружил личные данные в интернете",
-            callback_data="case_leak"
-        )],
-        [InlineKeyboardButton(
-            text="📩 Шантаж распространением личных данных",
-            callback_data="case_blackmail"
-        )],
-        [InlineKeyboardButton(
-            text="❓ Другое",
-            callback_data="case_other"
-        )],
+        [InlineKeyboardButton(text=back_text, callback_data=previous)],
+        [InlineKeyboardButton(text=home_text, callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-def gos_keyboard() -> InlineKeyboardMarkup:
-    """
-    Второй уровень – варианты, как взломали Госуслуги.
-    """
+def gos_keyboard(content: dict) -> InlineKeyboardMarkup:
+    gos = content.get("egov_submenu", {})
     kb = [
-        [InlineKeyboardButton(text="💻 Установил приложение", callback_data="gos_app")],
-        [InlineKeyboardButton(text="⬇️ Скачал файл", callback_data="gos_file")],
-        [InlineKeyboardButton(text="🔗 Перешёл по ссылке (QR-коду)", callback_data="gos_link")],
-        [InlineKeyboardButton(text="📞 Сообщил код подтверждения", callback_data="gos_code")],
-        [InlineKeyboardButton(text="📂 Внёс личные данные в анкету/форму", callback_data="gos_form")],
-        [InlineKeyboardButton(text="🌐 Совершил действие на сайте или в приложении", callback_data="gos_site")],
-        [InlineKeyboardButton(text="💬 Сообщил данные сам", callback_data="gos_self")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
-        [InlineKeyboardButton(text="❓ Другое", callback_data="gos_other")],
+        [InlineKeyboardButton(text=gos.get("app", "💻 Установил приложение"), callback_data="gos_app")],
+        [InlineKeyboardButton(text=gos.get("file", "⬇️ Скачал файл"), callback_data="gos_file")],
+        [InlineKeyboardButton(text=gos.get("link", "🔗 Перешёл по ссылке / QR"), callback_data="gos_link")],
+        [InlineKeyboardButton(text=gos.get("code", "📞 Сообщил код"), callback_data="gos_code")],
+        [InlineKeyboardButton(text=gos.get("form", "📂 Внёс данные в форму"), callback_data="gos_form")],
+        [InlineKeyboardButton(text=gos.get("site", "🌐 Действие на сайте/в приложении"), callback_data="gos_site")],
+        [InlineKeyboardButton(text=gos.get("self", "💬 Сам сообщил данные"), callback_data="gos_self")],
+        [InlineKeyboardButton(text=gos.get("back", "⬅️ Назад"), callback_data="back_main")],
+        [InlineKeyboardButton(text=gos.get("other", "❓ Другое"), callback_data="gos_other")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-def scenario_keyboard(previous: str) -> InlineKeyboardMarkup:
-    """
-    Клавиатура под подробной инструкцией:
-    - сформировать заявление;
-    - назад (previous);
-    - в главное меню.
-    previous – callback, куда ведёт «Назад» (например, 'case_gos' или 'back_main').
-    """
-    kb = [
-        [InlineKeyboardButton(
-            text="📝 Сформировать текст заявления",
-            callback_data="make_claim"
-        )],
-        [InlineKeyboardButton(
-            text="⬅️ Назад",
-            callback_data=previous
-        )],
-        [InlineKeyboardButton(
-            text="🏠 В главное меню",
-            callback_data="back_main"
-        )],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
-# ---------------- ОБРАБОТЧИКИ КОМАНД ----------------
+# ---------------- /start и выбор языка ----------------
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message) -> None:
-    """
-    /start – шапка + меню.
-    """
-
-    # 1) "Шапка" – описание возможностей бота
-    intro_text = (
-        "*Что может делать этот бот?*\n\n"
-        "Здравствуйте! Это анонимный помощник по кибербезопасности.\n\n"
-        "Если вы столкнулись с мошенничеством или подозрительными действиями "
-        "(подозрительные звонки, взлом аккаунта, переводы денег, странные ссылки), "
-        "бот подскажет, что делать в вашей ситуации и как уменьшить последствия.\n\n"
-        "Ниже выберите подходящую ситуацию."
-    )
-    await message.answer(intro_text)
-
-    # 2) Отдельное сообщение с главным меню (его мы редактируем дальше)
-    menu_text = (
-        "👮‍♂️ *Помощник по защите от мошенников*\n\n"
-        "📘 Расскажите о произошедшей ситуации, чтобы мы могли вам помочь.\n\n"
-        "Выберите вариант из списка:"
-    )
-    await message.answer(menu_text, reply_markup=main_keyboard())
-
-
-@dp.message(F.text == "/cancel")
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    """
-    /cancel – прервать заполнение заявления.
-    """
-    await state.clear()
-    await message.answer("Заполнение заявления прервано. Чтобы начать заново, нажмите любую кнопку или /start.")
-
-
-# ---------------- ГЛАВНОЕ МЕНЮ ----------------
-
-@dp.callback_query(F.data.startswith("case_"))
-async def process_main_menu(callback: CallbackQuery) -> None:
-    code = callback.data  # например 'case_gos'
-
-    # --- Госуслуги: отдельное подменю ---
-    if code == "case_gos":
-        await callback.message.edit_text(
-            "При каких обстоятельствах у вас взломали «Госуслуги»?",
-            reply_markup=gos_keyboard()
-        )
-        await callback.answer()
+    # Если язык ещё не выбран — предлагаем выбор языка
+    if message.from_user.id not in USER_LANG:
+        await message.answer(content_for(message.from_user.id).get("choose_lang", "Выберите язык:"), reply_markup=lang_keyboard())
         return
 
-    # --- Взлом соцсети ---
-    if code == "case_social":
-        text = (
-            "📱 *Взломали социальную сеть или мессенджер*\n\n"
-            "*СРОЧНО (прямо сейчас):*\n"
-            "• Попробуйте восстановить доступ через привязанный номер или почту.\n"
-            "• Смените пароль и включите двухфакторную аутентификацию.\n"
-            "• Выйдите из всех активных сессий в настройках аккаунта.\n\n"
-            "*В ближайшие сутки:*\n"
-            "• Напишите в поддержку сервиса о взломе.\n"
-            "• Предупредите друзей и родственников, что от вашего имени могли писать мошенники.\n\n"
-            "*НЕЛЬЗЯ:*\n"
-            "• Платить «за разблокировку аккаунта».\n"
-            "• Сообщать коды из SMS, пароли и данные карты третьим лицам."
-        )
-        await callback.message.edit_text(text, reply_markup=scenario_keyboard("back_main"))
-        await callback.answer()
-        return
+    content = content_for(message.from_user.id)
+    await message.answer(content.get("menu_title", "Меню"), reply_markup=main_keyboard(content))
 
-    # --- Оформили кредит ---
-    if code == "case_credit":
-        text = (
-            "📄 *На вас оформили кредит или микрозайм*\n\n"
-            "*СРОЧНО:*\n"
-            "• Свяжитесь с банком/МФО и сообщите, что кредит оформлен без вашего согласия.\n"
-            "• Попросите временно приостановить начисление штрафов и процентов.\n\n"
-            "*В ближайшие сутки:*\n"
-            "• Подайте заявление в полицию о мошенничестве.\n"
-            "• Запросите свою кредитную историю и проверьте все открытые кредиты.\n"
-            "• При необходимости поставьте запрет на удалённую выдачу кредитов.\n\n"
-            "*НЕЛЬЗЯ:*\n"
-            "• Игнорировать проблему и надеяться, что “само рассосётся”.\n"
-            "• Подписывать непонятные документы без консультации."
-        )
-        await callback.message.edit_text(text, reply_markup=scenario_keyboard("back_main"))
-        await callback.answer()
-        return
 
-    # --- Деньги списаны без согласия ---
-    if code == "case_money":
-        text = (
-            "💸 *Деньги списаны без вашего согласия*\n\n"
-            "*СРОЧНО:*\n"
-            "• Позвоните в банк по официальному номеру (с сайта/карты) и заблокируйте карту.\n"
-            "• Сообщите о несанкционированных операциях и запросите их оспаривание.\n\n"
-            "*В ближайшие сутки:*\n"
-            "• Напишите заявление в банк с описанием операций.\n"
-            "• При явном мошенничестве подайте заявление в полицию.\n\n"
-            "*НЕЛЬЗЯ:*\n"
-            "• Переводить деньги на «безопасный счёт», который предлагают по телефону.\n"
-            "• Устанавливать программы удалённого доступа по просьбе «сотрудников банка»."
-        )
-        await callback.message.edit_text(text, reply_markup=scenario_keyboard("back_main"))
-        await callback.answer()
-        return
+@dp.callback_query(F.data.startswith("set_lang:"))
+async def set_lang(callback: CallbackQuery) -> None:
+    lang = callback.data.split(":", 1)[1]
+    USER_LANG[callback.from_user.id] = "kz" if lang == "kz" else "ru"
 
-    # --- Остальные кейсы пока как заглушка ---
-    text = (
-        "Для этого варианта пока нет подробного сценария.\n\n"
-        "Опишите ситуацию максимально подробно в заявлении – бот поможет его составить.\n"
-        "Нажмите кнопку ниже, чтобы сформировать текст заявления."
-    )
-    await callback.message.edit_text(text, reply_markup=scenario_keyboard("back_main"))
+    content = content_for(callback.from_user.id)
+    await callback.message.edit_text(content.get("menu_title", "Меню"), reply_markup=main_keyboard(content))
     await callback.answer()
 
 
-# ---------------- НАЗАД В ГЛАВНОЕ МЕНЮ ----------------
+# ---------------- Категории из JSON ----------------
 
-@dp.callback_query(F.data == "back_main")
-async def back_to_main(callback: CallbackQuery) -> None:
-    text = (
-        "👮‍♂️ *Помощник по защите от мошенников*\n\n"
-        "Выберите ситуацию, которая с вами произошла:"
-    )
-    await callback.message.edit_text(text, reply_markup=main_keyboard())
+@dp.callback_query(F.data.startswith("case_json:"))
+async def process_json_case(callback: CallbackQuery) -> None:
+    content = content_for(callback.from_user.id)
+    cat_id = callback.data.split(":", 1)[1]
+    cat = get_category_by_id(content, cat_id)
+
+    if not cat:
+        await callback.answer(content.get("errors", {}).get("not_found", "Категория не найдена"), show_alert=True)
+        return
+
+    text = render_category_text(content, cat)
+    await callback.message.edit_text(text, reply_markup=scenario_keyboard(content, "back_main"))
     await callback.answer()
 
 
-# ---------------- ВНУТРЕННИЕ ВАРИАНТЫ ДЛЯ «ГОСУСЛУГ» ----------------
+# ---------------- eGov/ЭЦП подменю ----------------
+
+@dp.callback_query(F.data == "case_gos")
+async def open_gos_menu(callback: CallbackQuery) -> None:
+    content = content_for(callback.from_user.id)
+    await callback.message.edit_text(
+        content.get("egov_title", "Как произошёл доступ к eGov/ЭЦП?"),
+        reply_markup=gos_keyboard(content)
+    )
+    await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("gos_"))
 async def process_gos(callback: CallbackQuery) -> None:
+    content = content_for(callback.from_user.id)
     code = callback.data
+    egov_texts = content.get("egov_texts", {})
 
-    if code == "gos_app":
-        text = (
-            "💻 Вы устанавливали приложение перед взломом Госуслуг.\n\n"
-            "*СРОЧНО:*\n"
-            "• Удалите подозрительное приложение с устройства.\n"
-            "• С другого устройства зайдите в Госуслуги и смените пароль.\n\n"
-            "*В ближайшие сутки:*\n"
-            "• Смените пароли от почты и интернет-банка, если они были такими же.\n"
-            "• Проверьте разделы с заявками и услугами — не оформлено ли что-то без вас.\n\n"
-            "*НЕЛЬЗЯ:*\n"
-            "• Снова ставить то же приложение «по другой ссылке».\n"
-            "• Сообщать коды из SMS кому-либо."
-        )
-    elif code == "gos_file":
-        text = (
-            "⬇️ Перед взломом вы скачивали файл.\n\n"
-            "• Удалите файл и по возможности проверьте устройство антивирусом.\n"
-            "• Смените пароли от Госуслуг, почты и банков.\n"
-            "• В будущем не скачивайте файлы из писем и чатов от неизвестных отправителей."
-        )
-    elif code == "gos_link":
-        text = (
-            "🔗 Вы переходили по ссылке или QR-коду.\n\n"
-            "• Скорее всего, это был фишинговый сайт.\n"
-            "• Больше не переходите по этой ссылке.\n"
-            "• Смените пароли только через официальный сайт Госуслуг (проверяйте адрес).\n"
-            "• Если вводили данные карты — немедленно свяжитесь с банком и заблокируйте карту."
-        )
-    elif code == "gos_code":
-        text = (
-            "📞 Вы сообщили код подтверждения.\n\n"
-            "• Сразу смените пароль от Госуслуг.\n"
-            "• Если код был банковский, немедленно позвоните в банк.\n"
-            "• Помните: сотрудники госорганов и банков никогда не спрашивают коды из SMS."
-        )
-    elif code == "gos_form":
-        text = (
-            "📂 Вы ввели личные данные в анкету/форму.\n\n"
-            "• Смените пароли от важных сервисов, если использовали один и тот же пароль.\n"
-            "• Следите за появлением на ваше имя кредитов, штрафов и иных обязательств.\n"
-            "• При первом подозрении обращайтесь в банк и полицию."
-        )
-    elif code == "gos_site":
-        text = (
-            "🌐 Вы совершали действия на сайте или в приложении, которое могло быть поддельным.\n\n"
-            "• Не вводите там больше никаких данных.\n"
-            "• Смените пароли через официальный сайт Госуслуг.\n"
-            "• Проверьте устройство на вирусы."
-        )
-    elif code == "gos_self":
-        text = (
-            "💬 Вы сами сообщили свои данные злоумышленникам.\n\n"
-            "• Быстро смените пароли от всех важных сервисов.\n"
-            "• Сообщите в банк и, при необходимости, в полицию.\n"
-            "• В дальнейшем никому не сообщайте коды из SMS, пароли и CVV-код карты."
-        )
-    else:
-        text = (
-            "❓ Ситуация не подходит ни под один из вариантов.\n\n"
-            "Выберите ближайший по смыслу вариант или сразу сформируйте текст заявления."
-        )
-
-    await callback.message.edit_text(text, reply_markup=scenario_keyboard("case_gos"))
+    text = egov_texts.get(code) or egov_texts.get("gos_other") or "Нет инструкции."
+    await callback.message.edit_text(text, reply_markup=scenario_keyboard(content, "case_gos"))
     await callback.answer()
 
 
-# ---------------- МАСТЕР "СФОРМИРОВАТЬ ЗАЯВЛЕНИЕ" ----------------
+# ---------------- Назад в меню ----------------
 
-@dp.callback_query(F.data == "make_claim")
-async def claim_start(callback: CallbackQuery, state: FSMContext) -> None:
-    """
-    Старт мастера составления заявления.
-    """
-    await callback.message.answer(
-        "📝 Давайте составим текст заявления.\n\n"
-        "1️⃣ Напишите, пожалуйста, ваши *ФИО* полностью (как в документе):"
-    )
-    await state.set_state(ClaimForm.fullname)
+@dp.callback_query(F.data == "back_main")
+async def back_to_main(callback: CallbackQuery) -> None:
+    content = content_for(callback.from_user.id)
+    await callback.message.edit_text(content.get("menu_title", "Меню"), reply_markup=main_keyboard(content))
     await callback.answer()
-
-
-@dp.message(ClaimForm.fullname)
-async def claim_fullname(message: Message, state: FSMContext) -> None:
-    await state.update_data(fullname=message.text.strip())
-    await message.answer(
-        "2️⃣ Укажите *дату и время* ситуации "
-        "(например: `10.12.2025 около 17:30`):"
-    )
-    await state.set_state(ClaimForm.datetime)
-
-
-@dp.message(ClaimForm.datetime)
-async def claim_datetime(message: Message, state: FSMContext) -> None:
-    await state.update_data(datetime=message.text.strip())
-    await message.answer(
-        "3️⃣ Напишите, *где это произошло*:\n"
-        "банк, сайт, приложение, соцсеть и т.п. (кратко)."
-    )
-    await state.set_state(ClaimForm.channel)
-
-
-@dp.message(ClaimForm.channel)
-async def claim_channel(message: Message, state: FSMContext) -> None:
-    await state.update_data(channel=message.text.strip())
-    await message.answer(
-        "4️⃣ Кратко опишите, *что именно произошло* "
-        "(что просили сделать, какие действия вы выполнили, что в итоге случилось):"
-    )
-    await state.set_state(ClaimForm.description)
-
-
-@dp.message(ClaimForm.description)
-async def claim_description(message: Message, state: FSMContext) -> None:
-    await state.update_data(description=message.text.strip())
-    await message.answer(
-        "5️⃣ Укажите *примерную сумму* ущерба или напишите `неизвестна`, "
-        "если точной суммы нет:"
-    )
-    await state.set_state(ClaimForm.amount)
-
-
-@dp.message(ClaimForm.amount)
-async def claim_amount(message: Message, state: FSMContext) -> None:
-    await state.update_data(amount=message.text.strip())
-    data = await state.get_data()
-    await state.clear()
-
-    text = (
-        "📄 *Черновик заявления о возможном мошенничестве*\n\n"
-        f"Я, {data['fullname']}, сообщаю о следующей ситуации.\n\n"
-        f"{data['datetime']} при использовании сервиса ({data['channel']}) "
-        f"со мной произошла следующая ситуация: {data['description']}\n\n"
-        f"Примерная сумма причинённого (или возможного) материального ущерба: {data['amount']}.\n\n"
-        "Прошу провести проверку на предмет мошенничества и, при необходимости, "
-        "принять меры в соответствии с действующим законодательством.\n\n"
-        "Готов(а) предоставить дополнительные материалы: переписку, скриншоты, "
-        "выписки по операциям и иные документы.\n\n"
-        "Подпись: ______________________    Дата: ______________________"
-    )
-
-    await message.answer(
-        "✅ Черновик заявления сформирован. Вы можете скопировать текст ниже "
-        "и использовать его при обращении в банк, полицию или другую организацию:\n\n"
-        + text
-    )
 
 
 # ---------------- ЗАПУСК ----------------
